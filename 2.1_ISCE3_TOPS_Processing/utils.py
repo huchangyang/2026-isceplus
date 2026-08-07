@@ -705,7 +705,28 @@ def align_cslc_pair(ref_arr, ref_gt, sec_arr, sec_gt):
     common_gt = (x0_r + rc0 * dx, dx, 0, y0_r + rr0 * dy, 0, dy)
     return ref_aligned, sec_aligned, common_gt
 
-def compute_union_grid(extents, bbox_wsen, epsg_utm):
+def compute_union_grid(extents, bbox_wsen=None, epsg_utm=32605):
+    """Compute the stitched output grid from per-burst extents.
+
+    Parameters
+    ----------
+    extents : list of tuple
+        ``(x0, dx, y0, dy, nrows, ncols, epsg, proj_wkt)`` per input.
+    bbox_wsen : tuple or None
+        ``(west, south, east, north)`` EPSG:4326; the grid is clipped
+        to this AOI. None keeps the union extent of all inputs.
+    epsg_utm : int
+        EPSG code of the output CRS.
+
+    Returns
+    -------
+    out_gt : tuple
+        GDAL geotransform ``(x0, dx, 0, y0, 0, dy)`` preserving the
+        sign of *dx*/*dy* from the input extents (y0 is the northern
+        edge for ``dy < 0``, the southern edge for ``dy > 0``).
+    out_rows, out_cols : int
+    proj_wkt : str
+    """
     if not extents:
         raise ValueError('extents list is empty')
 
@@ -716,25 +737,29 @@ def compute_union_grid(extents, bbox_wsen, epsg_utm):
     ulx = min(e[0] for e in extents)                        # west
     lrx = max(e[0] + e[5] * e[1] for e in extents)          # east  (e[5]=ncols)
     uly = max(e[2] for e in extents)                        # north
-    lry = min(e[2] + e[3] * e[4] for e in extents)          # south (e[3]=dy<0, e[4]=nrows)
+    lry = min(e[2] + e[3] * e[4] for e in extents)          # south (e[3]=dy, e[4]=nrows)
 
-    # Clip to geographic bbox in UTM
-    tf = Transformer.from_crs('EPSG:4326', f'EPSG:{epsg_utm}', always_xy=True)
-    xs, ys = tf.transform(
-        [bbox_wsen[0], bbox_wsen[2], bbox_wsen[2], bbox_wsen[0]],
-        [bbox_wsen[1], bbox_wsen[1], bbox_wsen[3], bbox_wsen[3]],
-    )
-    bbox_xmin, bbox_ymin = min(xs), min(ys)
-    bbox_xmax, bbox_ymax = max(xs), max(ys)
+    # Clip to geographic bbox in UTM (None keeps the union extent)
+    if bbox_wsen is not None:
+        tf = Transformer.from_crs('EPSG:4326', f'EPSG:{epsg_utm}', always_xy=True)
+        xs, ys = tf.transform(
+            [bbox_wsen[0], bbox_wsen[2], bbox_wsen[2], bbox_wsen[0]],
+            [bbox_wsen[1], bbox_wsen[1], bbox_wsen[3], bbox_wsen[3]],
+        )
+        bbox_xmin, bbox_ymin = min(xs), min(ys)
+        bbox_xmax, bbox_ymax = max(xs), max(ys)
 
-    ulx = max(ulx, bbox_xmin)
-    lrx = min(lrx, bbox_xmax)
-    uly = min(uly, bbox_ymax)       # uly is north, bbox_ymax is north
-    lry = max(lry, bbox_ymin)       # lry is south, bbox_ymin is south
+        ulx = max(ulx, bbox_xmin)
+        lrx = min(lrx, bbox_xmax)
+        uly = min(uly, bbox_ymax)       # uly is north, bbox_ymax is north
+        lry = max(lry, bbox_ymin)       # lry is south, bbox_ymin is south
 
     out_cols = int((lrx - ulx) / abs(dx) + 0.5)             # lrx > ulx → positive
     out_rows = int(abs(uly - lry) / abs(dy) + 0.5)          # abs(uly-lry) > 0
-    out_gt = (ulx, dx, 0, uly, 0, dy)
+    # Preserve the sign of dx/dy; the origin y0 is the northern edge for
+    # dy < 0 (UTM) and the southern edge for dy > 0 (e.g. EPSG:4326).
+    y0 = uly if dy < 0 else lry
+    out_gt = (ulx, dx, 0, y0, 0, dy)
 
     return out_gt, out_rows, out_cols, proj_wkt
 
@@ -777,8 +802,8 @@ def blit_into_stitched(dst, dst_gt, src, src_gt, nodata_thresh=1e-6):
     valid = np.isfinite(src_chunk) & (np.abs(src_chunk) > nodata_thresh)
     dst[dst_r0:dst_r0 + h, dst_c0:dst_c0 + w][valid] = src_chunk[valid]
 
-def stitch_arrays(arrays_list, bbox_wsen, dx=5.0, dy=-10.0, epsg_utm=32605,
-                  method='last'):
+def stitch_arrays(arrays_list, bbox_wsen=None, dx=5.0, dy=-10.0,
+                  epsg_utm=32605, method='last'):
     """Stitch geocoded arrays via gdal_merge-style pixel-offset copy.
 
     Arrays with different geotransforms are filtered: only the group
@@ -788,7 +813,10 @@ def stitch_arrays(arrays_list, bbox_wsen, dx=5.0, dy=-10.0, epsg_utm=32605,
     Parameters
     ----------
     arrays_list : list of (arr, geotransform, proj_wkt) tuples
-    bbox_wsen : tuple  ``(west, south, east, north)`` EPSG:4326.
+    bbox_wsen : tuple or None
+        ``(west, south, east, north)`` EPSG:4326, the output extent is
+        clipped to this bounding box. None uses the union extent of all
+        input arrays (e.g. processing the entire burst).
     dx, dy : float  pixel sizes (metres). Ignored — derived from kept GT.
     epsg_utm : int  UTM EPSG code.
     method : {'first', 'last'}
@@ -852,26 +880,30 @@ def stitch_arrays(arrays_list, bbox_wsen, dx=5.0, dy=-10.0, epsg_utm=32605,
     uly = max(p['y_max'] for p in pieces)
     lry = min(p['y_min'] for p in pieces)
 
-    # Clip to bbox_wsen
-    tf = Transformer.from_crs('EPSG:4326', f'EPSG:{epsg_utm}', always_xy=True)
-    xs, ys = tf.transform(
-        [bbox_wsen[0], bbox_wsen[2], bbox_wsen[2], bbox_wsen[0]],
-        [bbox_wsen[1], bbox_wsen[1], bbox_wsen[3], bbox_wsen[3]],
-    )
-    bbox_xmin, bbox_ymin = min(xs), min(ys)
-    bbox_xmax, bbox_ymax = max(xs), max(ys)
+    # Clip to bbox_wsen (None keeps the union extent of all pieces)
+    if bbox_wsen is not None:
+        tf = Transformer.from_crs('EPSG:4326', f'EPSG:{epsg_utm}', always_xy=True)
+        xs, ys = tf.transform(
+            [bbox_wsen[0], bbox_wsen[2], bbox_wsen[2], bbox_wsen[0]],
+            [bbox_wsen[1], bbox_wsen[1], bbox_wsen[3], bbox_wsen[3]],
+        )
+        bbox_xmin, bbox_ymin = min(xs), min(ys)
+        bbox_xmax, bbox_ymax = max(xs), max(ys)
 
-    ulx = max(ulx, bbox_xmin)
-    lrx = min(lrx, bbox_xmax)
-    uly = min(uly, bbox_ymax)
-    lry = max(lry, bbox_ymin)
+        ulx = max(ulx, bbox_xmin)
+        lrx = min(lrx, bbox_xmax)
+        uly = min(uly, bbox_ymax)
+        lry = max(lry, bbox_ymin)
 
-    # Output grid (gdal_merge style: int((extent / ps) + 0.5))
+    # Output grid (gdal_merge style: int((extent / ps) + 0.5));
+    # preserve the sign of dx/dy; y0 is the northern edge for dy < 0
+    # (UTM) and the southern edge for dy > 0 (e.g. EPSG:4326).
     out_cols = int((lrx - ulx) / abs(dx) + 0.5)
     out_rows = int((uly - lry) / abs(dy) + 0.5)
-    out_dy = -abs(dy)
-    out_dx = abs(dx)
-    out_gt = (ulx, out_dx, 0, uly, 0, out_dy)
+    out_dx = dx
+    out_dy = dy
+    out_y0 = uly if dy < 0 else lry
+    out_gt = (ulx, out_dx, 0, out_y0, 0, out_dy)
 
     stitched = np.zeros((out_rows, out_cols), dtype=sample.dtype)
 
@@ -883,8 +915,10 @@ def stitch_arrays(arrays_list, bbox_wsen, dx=5.0, dy=-10.0, epsg_utm=32605,
         arr = p['arr']
         src_x0, src_y0 = p['x0'], p['y0']
 
-        xoff = int((src_x0 - ulx) / dx)
-        yoff = int((src_y0 - uly) / dy)
+        # Offsets relative to the output grid origin (out_gt), so the
+        # y-origin is uly (north) for dy<0 and lry (south) for dy>0.
+        xoff = int((src_x0 - out_gt[0]) / out_gt[1])
+        yoff = int((src_y0 - out_gt[3]) / out_gt[5])
 
         src_r0 = max(0, -yoff)
         src_r1 = min(arr.shape[0], out_rows - yoff)
@@ -916,7 +950,7 @@ def stitch_arrays(arrays_list, bbox_wsen, dx=5.0, dy=-10.0, epsg_utm=32605,
 
     return stitched, out_gt, proj_wkt
 
-def stitch_bursts(file_path_list, bbox_wsen, epsg_utm=None,
+def stitch_bursts(file_path_list, bbox_wsen=None, epsg_utm=None,
                   verbose=False):
     """Stitch geocoded GeoTIFF files by pixel-offset copy in one pass.
 
@@ -939,9 +973,10 @@ def stitch_bursts(file_path_list, bbox_wsen, epsg_utm=None,
     file_path_list : list of str or Path
         Paths to the per-burst (or per-tile) GeoTIFF files to be
         stitched.
-    bbox_wsen : tuple
+    bbox_wsen : tuple or None
         Geographic bounding box ``(west, south, east, north)`` in
-        EPSG:4326 that clips the output extent.
+        EPSG:4326 that clips the output extent. None (default) keeps
+        the union extent of all input files.
     epsg_utm : int, optional
         UTM EPSG code of the output grid.  When ``None`` (default) the
         EPSG is auto-detected from the source files.  If files span
@@ -3126,14 +3161,15 @@ def _read_cslc_subset(h5_path, wsen_buf, subdataset='/data/VV'):
 
     Reads only the pixel block intersecting *wsen_buf* (native CRS), so
     peak memory is bounded by the cropped part rather than the full burst.
+    When *wsen_buf* is None, the entire burst is read.
 
     Parameters
     ----------
     h5_path : str or Path
         Path to the OPERA CSLC HDF5 file.
-    wsen_buf : tuple
+    wsen_buf : tuple or None
         (west, south, east, north) in native CRS (or EPSG:4326 if the
-        file is in geographic coordinates).
+        file is in geographic coordinates). None reads the full burst.
     subdataset : str
         HDF5 subdataset path (default '/data/VV').
 
@@ -3157,34 +3193,38 @@ def _read_cslc_subset(h5_path, wsen_buf, subdataset='/data/VV'):
         return None, None, None, None
 
     # Transform wsen to native CRS
-    if epsg and epsg != 4326:
-        src_srs = osr.SpatialReference(); src_srs.ImportFromEPSG(4326)
-        dst_srs = osr.SpatialReference(); dst_srs.ImportFromEPSG(int(epsg))
-        t = osr.CoordinateTransformation(src_srs, dst_srs)
-        corners = [
-            t.TransformPoint(wsen_buf[1], wsen_buf[0]),  # SW  (lat,lon)
-            t.TransformPoint(wsen_buf[3], wsen_buf[0]),  # NW
-            t.TransformPoint(wsen_buf[3], wsen_buf[2]),  # NE
-            t.TransformPoint(wsen_buf[1], wsen_buf[2]),  # SE
-        ]
-        native_W = min(c[0] for c in corners)
-        native_E = max(c[0] for c in corners)
-        native_S = min(c[1] for c in corners)
-        native_N = max(c[1] for c in corners)
+    if wsen_buf is None:
+        # read the entire burst
+        c0, c1, r0, r1 = 0, len(x_coords), 0, len(y_coords)
     else:
-        native_W, native_S, native_E, native_N = wsen_buf
+        if epsg and epsg != 4326:
+            src_srs = osr.SpatialReference(); src_srs.ImportFromEPSG(4326)
+            dst_srs = osr.SpatialReference(); dst_srs.ImportFromEPSG(int(epsg))
+            t = osr.CoordinateTransformation(src_srs, dst_srs)
+            corners = [
+                t.TransformPoint(wsen_buf[1], wsen_buf[0]),  # SW  (lat,lon)
+                t.TransformPoint(wsen_buf[3], wsen_buf[0]),  # NW
+                t.TransformPoint(wsen_buf[3], wsen_buf[2]),  # NE
+                t.TransformPoint(wsen_buf[1], wsen_buf[2]),  # SE
+            ]
+            native_W = min(c[0] for c in corners)
+            native_E = max(c[0] for c in corners)
+            native_S = min(c[1] for c in corners)
+            native_N = max(c[1] for c in corners)
+        else:
+            native_W, native_S, native_E, native_N = wsen_buf
 
-    # Find pixel range in native coordinates
-    col_mask = (x_coords >= native_W) & (x_coords <= native_E)
-    row_mask = (y_coords >= native_S) & (y_coords <= native_N)
-    if not np.any(col_mask) or not np.any(row_mask):
-        print(f'  skip (no overlap): {Path(h5_path).name}')
-        return None, None, None, None
+        # Find pixel range in native coordinates
+        col_mask = (x_coords >= native_W) & (x_coords <= native_E)
+        row_mask = (y_coords >= native_S) & (y_coords <= native_N)
+        if not np.any(col_mask) or not np.any(row_mask):
+            print(f'  skip (no overlap): {Path(h5_path).name}')
+            return None, None, None, None
 
-    cols = np.where(col_mask)[0]
-    rows = np.where(row_mask)[0]
-    c0, c1 = int(cols[0]), int(cols[-1]) + 1
-    r0, r1 = int(rows[0]), int(rows[-1]) + 1
+        cols = np.where(col_mask)[0]
+        rows = np.where(row_mask)[0]
+        c0, c1 = int(cols[0]), int(cols[-1]) + 1
+        r0, r1 = int(rows[0]), int(rows[-1]) + 1
 
     # 1-pixel margin
     c0 = max(0, c0 - 1)
@@ -3218,7 +3258,7 @@ def _read_cslc_subset(h5_path, wsen_buf, subdataset='/data/VV'):
     return data, gt, epsg, proj_wkt
 
 def generate_stitched_ifgrams(
-    cslc_dir, date12_list, output_dir, bbox_wsen,
+    cslc_dir, date12_list, output_dir, bbox_wsen=None,
     burst_id_list=None, buffer=0.05, coh_win=5, lks_y=2, lks_x=4,
     save_full_res=False, save_cropped_slc=False, save_ifgs=False,
     subdataset='/data/VV',
@@ -3250,19 +3290,23 @@ def generate_stitched_ifgrams(
         Interferometric pairs, e.g. ``[('20240915', '20241009'), ...]``.
     output_dir : str or Path
         Output directory. Structure (per pair):
-          ``{output_dir}/{d1}_{d2}/mli_{d1}_{d2}.int.tif``
+          ``{output_dir}/{d1}_{d2}/mli.int.tif``
         and, if *save_full_res*:
-          ``{output_dir}/{d1}_{d2}/{d1}_{d2}.int.tif``
-          ``{output_dir}/{d1}_{d2}/{d1}_{d2}.coh.tif``
+          ``{output_dir}/{d1}_{d2}/full.int.tif``
+          ``{output_dir}/{d1}_{d2}/full.coh.tif``
         and optionally:
           ``{output_dir}/{burst_id}/{date}.slc.tif`` (save_cropped_slc)
-          ``{output_dir}/{burst_id}/{d1}_{d2}.int.tif`` + ``.coh.tif`` (save_ifgs)
-    bbox_wsen : tuple
-        (west, south, east, north) in EPSG:4326.
+          ``{output_dir}/{burst_id}/full.int.tif`` + ``full.coh.tif`` (save_ifgs)
+    bbox_wsen : tuple or None
+        (west, south, east, north) in EPSG:4326. The output is clipped
+        to this AOI. None processes the entire burst(s): the full burst
+        is read and stitched at its union extent (the *buffer* argument
+        is then ignored).
     burst_id_list : list of str, optional
         Burst IDs to process; default: all ``t*_*_iw*`` dirs under *cslc_dir*.
     buffer : float
         Buffer (deg) added around *bbox_wsen* when cropping each burst.
+        Only used when *bbox_wsen* is not None.
     coh_win : int
         Sliding-window size for coherence estimation (default 5).
     lks_y, lks_x : int
@@ -3283,10 +3327,10 @@ def generate_stitched_ifgrams(
     -------
     ifg_ml_list : list of Path
         Multilooked stitched interferogram files
-        (``{output_dir}/{d1}_{d2}/mli_{d1}_{d2}.int.tif``).
+        (``{output_dir}/{d1}_{d2}/mli.int.tif``).
     coh_list : list of Path
         Stitched coherence files at full resolution (not multilooked)
-        (``{output_dir}/{d1}_{d2}/{d1}_{d2}.coh.tif``).
+        (``{output_dir}/{d1}_{d2}/full.coh.tif``).
         Empty when *save_full_res* is False.
     """
     cslc_dir = Path(cslc_dir)
@@ -3299,8 +3343,13 @@ def generate_stitched_ifgrams(
             if d.is_dir() and burst_pattern.match(d.name))
     print(f'Bursts: {len(burst_id_list)}  Pairs: {len(date12_list)}')
 
-    wsen_buf = (bbox_wsen[0] - buffer, bbox_wsen[1] - buffer,
-                bbox_wsen[2] + buffer, bbox_wsen[3] + buffer)
+    # bbox_wsen=None -> process the entire burst(s): full-burst read,
+    # union-extent stitching, buffer is ignored.
+    wsen_buf = None if bbox_wsen is None else (
+        bbox_wsen[0] - buffer, bbox_wsen[1] - buffer,
+        bbox_wsen[2] + buffer, bbox_wsen[3] + buffer)
+    if bbox_wsen is None:
+        print('  buffer ignored: processing the entire burst(s).')
 
     ifg_ml_list, coh_list = [], []
     for k, date12 in enumerate(date12_list):
@@ -3384,7 +3433,6 @@ def generate_stitched_ifgrams(
             epsg_utm = 32605
         stitched_ifg, out_gt, proj_wkt = stitch_arrays(
             ifg_pieces, bbox_wsen, epsg_utm=epsg_utm)
-
         # ---- 3) optionally save full-resolution stitched products ----
         if save_full_res:
             stitched_coh, _, _ = stitch_arrays(coh_pieces, bbox_wsen, epsg_utm=epsg_utm)
